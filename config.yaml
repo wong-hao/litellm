@@ -1,0 +1,8 @@
+model_list:
+  - model_name: qwen3:0.6b
+    litellm_params:
+      model: ollama/qwen3:0.6b
+      api_base: http://host.docker.internal:11434
+  - model_name: github_copilot/gpt-5-mini
+    litellm_params:
+      model: github_copilot/gpt-5-mini
