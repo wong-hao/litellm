@@ -502,9 +502,7 @@ def _enforce_upperbound_key_params(
 
     for elem in data:
         key, value = elem
-        upperbound_value = getattr(
-            litellm.upperbound_key_generate_params, key, None
-        )
+        upperbound_value = getattr(litellm.upperbound_key_generate_params, key, None)
         if upperbound_value is not None:
             if value is None:
                 if fill_defaults:
@@ -524,9 +522,7 @@ def _enforce_upperbound_key_params(
                             },
                         )
                 elif key in ["budget_duration", "duration"]:
-                    upperbound_duration = duration_in_seconds(
-                        duration=upperbound_value
-                    )
+                    upperbound_duration = duration_in_seconds(duration=upperbound_value)
                     if value == "-1":
                         user_duration = float("inf")
                     else:
@@ -1759,9 +1755,7 @@ async def _process_single_key_update(
         decision = result.get("decision", True)
         message = result.get("message", "Authentication Failed - Custom Auth Rule")
         if not decision:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail=message
-            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=message)
 
     # Enforce upperbound key params on update (don't fill defaults)
     _enforce_upperbound_key_params(update_key_request, fill_defaults=False)
@@ -2638,22 +2632,39 @@ async def info_key_fn_v2(
                 detail={"message": "Malformed request. No keys passed in."},
             )
 
-        key_info = await prisma_client.get_data(
-            token=data.keys, table_name="key", query_type="find_all"
-        )
-        if key_info is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"message": "No keys found"},
+        # Resolve key_aliases to tokens so we never pass token=None (unbounded query)
+        tokens_to_query = list(data.keys) if data.keys else []
+        if data.key_aliases:
+            alias_rows = await prisma_client.db.litellm_verificationtoken.find_many(
+                where={"key_alias": {"in": data.key_aliases}},
+                include={"litellm_budget_table": True},
             )
+            alias_tokens = [row.token for row in alias_rows if row.token]
+            tokens_to_query.extend(alias_tokens)
+
+        if not tokens_to_query:
+            return {"key": data.keys, "info": []}
+
+        key_info = await prisma_client.get_data(
+            token=tokens_to_query, table_name="key", query_type="find_all"
+        )
+        if not key_info:
+            return {"key": data.keys, "info": []}
+
         filtered_key_info = []
         for k in key_info:
+            if not await _can_user_query_key_info(
+                user_api_key_dict=user_api_key_dict,
+                key=k.token,
+                key_info=k,
+            ):
+                continue
             try:
-                k = k.model_dump()  # noqa
+                k_dict = k.model_dump()
             except Exception:
-                # if using pydantic v1
-                k = k.dict()
-            filtered_key_info.append(k)
+                k_dict = k.dict()
+            k_dict.pop("token", None)
+            filtered_key_info.append(k_dict)
         return {"key": data.keys, "info": filtered_key_info}
 
     except Exception as e:
@@ -4228,13 +4239,19 @@ async def list_keys(
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
     page: int = Query(1, description="Page number", ge=1),
     size: int = Query(10, description="Page size", ge=1, le=100),
-    user_id: Optional[str] = Query(None, description="Filter keys by user ID. Supports partial matching (substring, case-insensitive)."),
+    user_id: Optional[str] = Query(
+        None,
+        description="Filter keys by user ID. Supports partial matching (substring, case-insensitive).",
+    ),
     team_id: Optional[str] = Query(None, description="Filter keys by team ID"),
     organization_id: Optional[str] = Query(
         None, description="Filter keys by organization ID"
     ),
     key_hash: Optional[str] = Query(None, description="Filter keys by key hash"),
-    key_alias: Optional[str] = Query(None, description="Filter keys by key alias. Supports partial matching (substring, case-insensitive)."),
+    key_alias: Optional[str] = Query(
+        None,
+        description="Filter keys by key alias. Supports partial matching (substring, case-insensitive).",
+    ),
     return_full_object: bool = Query(False, description="Return full key object"),
     include_team_keys: bool = Query(
         False, description="Include all keys for teams that user is an admin of."
@@ -4382,6 +4399,42 @@ async def list_keys(
         )
 
 
+async def _apply_non_admin_alias_scope(
+    user_api_key_dict: UserAPIKeyAuth,
+    prisma_client: Any,
+    query_params: List[Any],
+    where_parts: List[str],
+) -> None:
+    """Append SQL scope conditions so non-admin users only see aliases for
+    keys they own or keys belonging to teams they are members of."""
+    scope_conditions: List[str] = []
+    if user_api_key_dict.user_id:
+        query_params.append(user_api_key_dict.user_id)
+        scope_conditions.append(f"user_id = ${len(query_params)}")
+
+    # Look up the user's teams from the user table
+    user_teams: List[str] = []
+    if user_api_key_dict.user_id:
+        user_row = await prisma_client.db.litellm_usertable.find_unique(
+            where={"user_id": user_api_key_dict.user_id}
+        )
+        if user_row is not None:
+            user_teams = getattr(user_row, "teams", []) or []
+
+    if user_teams:
+        team_placeholders = ", ".join(
+            f"${len(query_params) + i + 1}" for i in range(len(user_teams))
+        )
+        query_params.extend(user_teams)
+        scope_conditions.append(f"team_id IN ({team_placeholders})")
+
+    if scope_conditions:
+        where_parts.append(f"({' OR '.join(scope_conditions)})")
+    else:
+        # No user_id and no teams — return nothing
+        where_parts.append("FALSE")
+
+
 @router.get(
     "/key/aliases",
     tags=["key management"],
@@ -4394,6 +4447,9 @@ async def key_aliases(
     size: int = Query(50, ge=1, le=100, description="Page size"),
     search: Optional[str] = Query(
         None, description="Search key aliases (case-insensitive partial match)"
+    ),
+    team_id: Optional[str] = Query(
+        None, description="Filter aliases to keys belonging to this team"
     ),
 ) -> Dict[str, Any]:
     """
@@ -4439,36 +4495,17 @@ async def key_aliases(
             LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY.value,
         ]
         if not is_proxy_admin:
-            scope_conditions: List[str] = []
-            if user_api_key_dict.user_id:
-                query_params.append(user_api_key_dict.user_id)
-                scope_conditions.append(f"user_id = ${len(query_params)}")
-
-            # Look up the user's teams from the user table
-            user_teams: List[str] = []
-            if user_api_key_dict.user_id:
-                user_row = await prisma_client.db.litellm_usertable.find_unique(
-                    where={"user_id": user_api_key_dict.user_id}
-                )
-                if user_row is not None:
-                    user_teams = getattr(user_row, "teams", []) or []
-
-            if user_teams:
-                team_placeholders = ", ".join(
-                    f"${len(query_params) + i + 1}" for i in range(len(user_teams))
-                )
-                query_params.extend(user_teams)
-                scope_conditions.append(f"team_id IN ({team_placeholders})")
-
-            if scope_conditions:
-                where_parts.append(f"({' OR '.join(scope_conditions)})")
-            else:
-                # No user_id and no teams — return nothing
-                where_parts.append("FALSE")
+            await _apply_non_admin_alias_scope(
+                user_api_key_dict, prisma_client, query_params, where_parts
+            )
 
         if search:
             query_params.append(f"%{search}%")
             where_parts.append(f"key_alias ILIKE ${len(query_params)}")
+
+        if team_id:
+            query_params.append(team_id)
+            where_parts.append(f"team_id = ${len(query_params)}")
 
         where_sql = " AND ".join(where_parts)
 
