@@ -1,19 +1,19 @@
 services:
   litellm:
-    build:
-      context: .
-      args:
-        target: runtime
-    image: docker.litellm.ai/berriai/litellm:main-stable
+    #build:
+    #  context: .
+    #  args:
+    #    target: runtime
+    image: ghcr.io/berriai/litellm:v1.100.0
     #########################################
     ## Uncomment these lines to start proxy with a config.yaml file ##
-    # volumes:
-    #  - ./config.yaml:/app/config.yaml
-    # command:
-    #  - "--config=/app/config.yaml"
+    volumes:
+     - ./config.yaml:/app/config.yaml
+    command:
+     - "--config=/app/config.yaml"
     ##############################################
     ports:
-      - "4000:4000" # Map the container port to the host, change the host port if necessary
+      - "127.0.0.1:4000:4000" # Map the container port to the host, change the host port if necessary
     environment:
       DATABASE_URL: "postgresql://llmproxy:dbpassword9090@db:5432/litellm"
       # Optional: route read-only queries (find_*, count, group_by, query_raw/_first)
@@ -22,10 +22,14 @@ services:
       # is auto-refreshed alongside the writer.
       # DATABASE_URL_READ_REPLICA: "postgresql://llmproxy:dbpassword9090@db-reader:5432/litellm"
       STORE_MODEL_IN_DB: "True" # allows adding models to proxy via UI
+      #LITELLM_LOG: "DEBUG" # enable debug logs
     env_file:
       - .env # Load local .env file
     depends_on:
       - db  # Indicates that this service depends on the 'db' service, ensuring 'db' starts first
+      - litellm-redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:  # Defines the health check configuration for the container
       test:
         - CMD-SHELL
@@ -34,6 +38,8 @@ services:
       timeout: 10s   # Health check command times out after 10 seconds
       retries: 3     # Retry up to 3 times if health check fails
       start_period: 40s  # Wait 40 seconds after container start before beginning health checks
+    networks:
+        - shared_net
 
   db:
     image: postgres:16
@@ -52,6 +58,8 @@ services:
       interval: 1s
       timeout: 5s
       retries: 10
+    networks:
+      - shared_net
 
   prometheus:
     image: prom/prometheus
@@ -65,9 +73,39 @@ services:
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=15d"
     restart: always
+    networks:
+      - shared_net
+
+  litellm-redis:
+    image: redis:latest
+    container_name: litellm_redis
+    restart: always
+
+    command: redis-server --appendonly yes
+
+    volumes:
+      - redis_data:/data
+
+    ports:
+      - "127.0.0.1:6379:6379"
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+    networks:
+      - shared_net
 
 volumes:
   prometheus_data:
     driver: local
   postgres_data:
     name: litellm_postgres_data # Named volume for Postgres data persistence
+  redis_data:
+    name: litellm_redis_data
+
+networks:
+  shared_net:
+    external: true
