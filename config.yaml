@@ -17,3 +17,4 @@ litellm_settings:
 general_settings:
   user_api_key_cache_ttl: 300
   disable_env_credential_login: true
+  master_key: os.environ/LITELLM_MASTER_KEY
