@@ -5,6 +5,7 @@ import copy
 import datetime
 import functools
 import json
+import math
 import os
 import re
 import subprocess
@@ -79,6 +80,7 @@ from litellm.litellm_core_utils.core_helpers import (
 )
 from litellm.litellm_core_utils.error_normalization import normalize_error
 from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
+from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR, set_hidden_param
 from litellm.litellm_core_utils.internal_call_metadata import (
     MODEL_ACCESS_GROUP_METADATA_KEY,
     is_unbilled_non_inference_call,
@@ -119,7 +121,7 @@ from litellm.llms.base_llm.search.transformation import SearchResponse
 from litellm.responses.utils import ResponseAPILoggingUtils
 from litellm.types.agents import LiteLLMSendMessageResponse
 from litellm.types.containers.main import ContainerObject
-from litellm.types.decisions import DecisionsResponse
+from litellm.types.decisions import DecisionsResponse, OpenAIDecisionResponse
 from litellm.types.integrations.s3_v2 import S3PartitionGranularity
 from litellm.types.interactions import (
     InteractionsAPIResponse,
@@ -290,7 +292,7 @@ else:
     _GENERIC_API_LOGGER_CLS: Final = GenericAPILogger
 _in_memory_loggers: Final[list[CustomLogger]] = []
 
-_STANDARD_LOGGING_METADATA_RESOLVED_KEYS: Final[frozenset[str]] = frozenset(("used_client_oauth_token",))
+_STANDARD_LOGGING_METADATA_RESOLVED_KEYS: Final[frozenset[str]] = frozenset(("used_client_oauth_token", "usage_object"))
 _STANDARD_LOGGING_METADATA_KEYS: Final[frozenset[str]] = (
     frozenset(StandardLoggingMetadata.__annotations__.keys()) - _STANDARD_LOGGING_METADATA_RESOLVED_KEYS
 )
@@ -731,9 +733,11 @@ class Logging(LiteLLMLoggingBaseClass):
         # Initialize cost breakdown field
         self.cost_breakdown: CostBreakdown | None = None
         self.billed_token_rates: BilledTokenRates | None = None
+        self._provider_reported_cost: float | None = None
 
         # Init Caching related details
         self.caching_details: CachingDetails | None = None
+        self.vertex_ai_cache_creation_input_tokens: int = 0
         # Timing for results that cannot carry ``_hidden_params`` (plain-dict /v1/messages
         # responses and the bridge stream wrappers); see ``update_response_metadata``.
         self.response_timing_metrics: Mapping[str, float] = {}
@@ -1865,7 +1869,7 @@ class Logging(LiteLLMLoggingBaseClass):
             else response_result
         )
 
-        result_hidden_params: Final = getattr(priced_result, "_hidden_params", None) or MappingProxyType({})
+        result_hidden_params: Final = getattr(priced_result, HIDDEN_PARAMS_ATTR, None) or MappingProxyType({})
         if isinstance(priced_result, (BaseModel, HttpxBinaryResponseContent)) and hasattr(
             priced_result, "_hidden_params"
         ):
@@ -1947,7 +1951,16 @@ class Logging(LiteLLMLoggingBaseClass):
             return None
 
         try:
-            response_cost: Final = litellm.response_cost_calculator(**response_cost_calculator_kwargs)
+            reported_cost: Final = self._provider_reported_cost
+            response_cost: Final = (
+                reported_cost
+                if isinstance(reported_cost, float)
+                and math.isfinite(reported_cost)
+                and reported_cost >= 0
+                and not custom_pricing
+                and base_model is None
+                else litellm.response_cost_calculator(**response_cost_calculator_kwargs)
+            )
 
             verbose_logger.debug("response_cost: %s", response_cost)
             additional_response_cost: Final[object] = self.model_call_details.get("additional_response_cost")
@@ -2067,7 +2080,7 @@ class Logging(LiteLLMLoggingBaseClass):
 
     def _custom_pricing_for(self, result: object) -> bool:
         litellm_params: Final = getattr(self, "litellm_params", None)
-        result_hidden_params: Final = getattr(result, "_hidden_params", None) or MappingProxyType({})
+        result_hidden_params: Final = getattr(result, HIDDEN_PARAMS_ATTR, None) or MappingProxyType({})
         additional_headers: Final = (
             result_hidden_params.get("additional_headers")
             if isinstance(result_hidden_params, dict)
@@ -2115,7 +2128,7 @@ class Logging(LiteLLMLoggingBaseClass):
             import httpx
 
             completion_response = result.model_dump(by_alias=True) if isinstance(result, BaseModel) else dict(result)
-            return litellm.VertexGeminiConfig()._transform_google_generate_content_to_openai_model_response(
+            return litellm.VertexGeminiConfig().transform_google_generate_content_to_openai_model_response(
                 completion_response=completion_response,
                 model_response=ModelResponse(),
                 model=self.model or "",
@@ -2416,7 +2429,7 @@ class Logging(LiteLLMLoggingBaseClass):
         """
         if logging_result is None:
             return
-        hidden_params: Final = getattr(logging_result, "_hidden_params", None)
+        hidden_params: Final = getattr(logging_result, HIDDEN_PARAMS_ATTR, None)
         if not hidden_params:
             return
         if self.model_call_details.get("litellm_params") is None:
@@ -2440,7 +2453,7 @@ class Logging(LiteLLMLoggingBaseClass):
     ):
         """Resolve hidden params, compute response cost, and emit the standard logging payload."""
         self._surface_response_headers_from_result(logging_result)
-        hidden_params: Final = getattr(logging_result, "_hidden_params", {})
+        hidden_params: Final = getattr(logging_result, HIDDEN_PARAMS_ATTR, {})
         if hidden_params:
             if self.model_call_details.get("litellm_params") is not None:
                 self.model_call_details["litellm_params"].setdefault("metadata", {})
@@ -2506,7 +2519,7 @@ class Logging(LiteLLMLoggingBaseClass):
         self.callback_duration_ms += (time.time() - _start) * 1000
         return payload
 
-    def _transform_usage_objects(self, result):
+    def _transform_usage_objects(self, result: object) -> object:
         if isinstance(result, ResponsesAPIResponse):
             result = result.model_copy()
             transformed_usage = ResponseAPILoggingUtils.transform_response_api_usage_to_chat_usage(result.usage)
@@ -2544,13 +2557,13 @@ class Logging(LiteLLMLoggingBaseClass):
 
     def _success_handler_helper_fn(
         self,
-        result=None,
-        start_time=None,
-        end_time=None,
-        cache_hit=None,
+        result: object = None,
+        start_time: datetime.datetime | None = None,
+        end_time: datetime.datetime | None = None,
+        cache_hit: bool | None = None,
         standard_logging_object: StandardLoggingPayload | None = None,
         build_logging_payload: bool = True,
-    ):
+    ) -> tuple[datetime.datetime, datetime.datetime, object]:
         try:
             if start_time is None:
                 start_time = self.start_time
@@ -2649,6 +2662,7 @@ class Logging(LiteLLMLoggingBaseClass):
             or isinstance(logging_result, OCRResponse)  # OCR
             or isinstance(logging_result, SearchResponse)  # Search API
             or isinstance(logging_result, DecisionsResponse)
+            or isinstance(logging_result, OpenAIDecisionResponse)
             or (
                 isinstance(logging_result, InteractionsAPIResponse)
                 and logging_result.usage is not None
@@ -2715,7 +2729,7 @@ class Logging(LiteLLMLoggingBaseClass):
         Left in place they overwrite the create's real deployment with the
         poll's empty one in the payload every logging integration reads.
         """
-        settled_hidden_params: Final = getattr(result, "_hidden_params", None)
+        settled_hidden_params: Final = getattr(result, HIDDEN_PARAMS_ATTR, None)
         if isinstance(settled_hidden_params, dict):
             for poll_scoped_key in ("response_cost", "model_id", "litellm_model_name"):
                 settled_hidden_params.pop(poll_scoped_key, None)
@@ -3289,13 +3303,12 @@ class Logging(LiteLLMLoggingBaseClass):
             batch_successful_requests: Final = kwargs.get("batch_successful_requests", None)
             batch_failed_requests: Final = kwargs.get("batch_failed_requests", None)
             has_explicit_batch_data: Final = all(x is not None for x in (batch_cost, batch_usage, batch_models))
-
             should_compute_batch_data: Final = not has_explicit_batch_data and batch_cost_is_final(result)
             if has_explicit_batch_data:
-                result._hidden_params["response_cost"] = batch_cost
-                result._hidden_params["batch_models"] = batch_models
-                result._hidden_params["batch_successful_requests"] = batch_successful_requests  # pyright: ignore[reportPrivateUsage]  # rebind-ok: same result._hidden_params pattern as response_cost/batch_models above
-                result._hidden_params["batch_failed_requests"] = batch_failed_requests  # pyright: ignore[reportPrivateUsage]  # rebind-ok: same pattern as above
+                set_hidden_param(result, "response_cost", batch_cost)
+                set_hidden_param(result, "batch_models", batch_models)
+                set_hidden_param(result, "batch_successful_requests", batch_successful_requests)
+                set_hidden_param(result, "batch_failed_requests", batch_failed_requests)
                 result.usage = batch_usage
                 batch_prompt_cost: Final = kwargs.get("batch_prompt_cost", None)
                 batch_completion_cost: Final = kwargs.get("batch_completion_cost", None)
@@ -3320,10 +3333,10 @@ class Logging(LiteLLMLoggingBaseClass):
                     model_info=self.get_router_deployment_model_info(),
                 )
 
-                result._hidden_params["response_cost"] = batch_result.cost
-                result._hidden_params["batch_models"] = batch_result.models
-                result._hidden_params["batch_successful_requests"] = batch_result.successful_requests  # pyright: ignore[reportPrivateUsage]  # rebind-ok: same pattern as above
-                result._hidden_params["batch_failed_requests"] = batch_result.failed_requests  # pyright: ignore[reportPrivateUsage]  # rebind-ok: same pattern as above
+                set_hidden_param(result, "response_cost", batch_result.cost)
+                set_hidden_param(result, "batch_models", batch_result.models)
+                set_hidden_param(result, "batch_successful_requests", batch_result.successful_requests)
+                set_hidden_param(result, "batch_failed_requests", batch_result.failed_requests)
                 result.usage = batch_result.usage
                 self.set_cost_breakdown(
                     input_cost=batch_result.prompt_cost,
@@ -4361,7 +4374,7 @@ class Logging(LiteLLMLoggingBaseClass):
         if httpx_response is None:
             raise ValueError("Google GenAI Generate Content: httpx_response is None")
         dict_result: Final = httpx_response.json()
-        result = litellm.VertexGeminiConfig()._transform_google_generate_content_to_openai_model_response(
+        result = litellm.VertexGeminiConfig().transform_google_generate_content_to_openai_model_response(
             completion_response=dict_result,
             model_response=litellm.ModelResponse(),
             model=self.model,
@@ -4938,6 +4951,15 @@ def _init_custom_logger_compatible_class(
             vantage_logger: Final = VantageLogger()
             _in_memory_loggers.append(vantage_logger)
             return vantage_logger
+        elif logging_integration == "ternary":
+            from litellm.integrations.ternary.ternary_logger import TernaryLogger
+
+            for callback in _in_memory_loggers:
+                if isinstance(callback, TernaryLogger):
+                    return callback
+            ternary_logger: Final = TernaryLogger()
+            _in_memory_loggers.append(ternary_logger)
+            return ternary_logger
         elif logging_integration == "deepeval":
             for callback in _in_memory_loggers:
                 if isinstance(callback, DeepEvalLogger):
@@ -4969,17 +4991,17 @@ def _init_custom_logger_compatible_class(
             return _otel_logger
         elif logging_integration == "dynamic_rate_limiter":
             from litellm.proxy.hooks.dynamic_rate_limiter import (
-                _PROXY_DynamicRateLimitHandler,
+                PROXY_DynamicRateLimitHandler,
             )
 
             for callback in _in_memory_loggers:
-                if isinstance(callback, _PROXY_DynamicRateLimitHandler):
+                if isinstance(callback, PROXY_DynamicRateLimitHandler):
                     return callback
 
             if internal_usage_cache is None:
                 raise Exception(f"Internal Error: Cache cannot be empty - internal_usage_cache={internal_usage_cache}")
 
-            dynamic_rate_limiter_obj: Final = _PROXY_DynamicRateLimitHandler(internal_usage_cache=internal_usage_cache)
+            dynamic_rate_limiter_obj: Final = PROXY_DynamicRateLimitHandler(internal_usage_cache=internal_usage_cache)
 
             if llm_router is not None and isinstance(llm_router, litellm.Router):
                 dynamic_rate_limiter_obj.update_variables(llm_router=llm_router)
@@ -4987,17 +5009,19 @@ def _init_custom_logger_compatible_class(
             return dynamic_rate_limiter_obj
         elif logging_integration == "dynamic_rate_limiter_v3":
             from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
-                _PROXY_DynamicRateLimitHandlerV3,
+                PROXY_DynamicRateLimitHandlerV3,
             )
 
             for callback in _in_memory_loggers:
-                if isinstance(callback, _PROXY_DynamicRateLimitHandlerV3):
+                if isinstance(callback, PROXY_DynamicRateLimitHandlerV3):
                     return callback
 
             if internal_usage_cache is None:
                 raise Exception(f"Internal Error: Cache cannot be empty - internal_usage_cache={internal_usage_cache}")
 
-            dynamic_rate_limiter_obj_v3 = _PROXY_DynamicRateLimitHandlerV3(internal_usage_cache=internal_usage_cache)
+            dynamic_rate_limiter_obj_v3: Final = PROXY_DynamicRateLimitHandlerV3(
+                internal_usage_cache=internal_usage_cache
+            )
 
             if llm_router is not None and isinstance(llm_router, litellm.Router):
                 dynamic_rate_limiter_obj_v3.update_variables(llm_router=llm_router)
@@ -5441,6 +5465,12 @@ def get_custom_logger_compatible_class(
             for callback in _in_memory_loggers:
                 if isinstance(callback, VantageLogger):
                     return callback
+        elif logging_integration == "ternary":
+            from litellm.integrations.ternary.ternary_logger import TernaryLogger
+
+            for callback in _in_memory_loggers:
+                if isinstance(callback, TernaryLogger):
+                    return callback
         elif logging_integration == "deepeval":
             for callback in _in_memory_loggers:
                 if isinstance(callback, DeepEvalLogger):
@@ -5546,19 +5576,19 @@ def get_custom_logger_compatible_class(
 
         elif logging_integration == "dynamic_rate_limiter":
             from litellm.proxy.hooks.dynamic_rate_limiter import (
-                _PROXY_DynamicRateLimitHandler,
+                PROXY_DynamicRateLimitHandler,
             )
 
             for callback in _in_memory_loggers:
-                if isinstance(callback, _PROXY_DynamicRateLimitHandler):
+                if isinstance(callback, PROXY_DynamicRateLimitHandler):
                     return callback
         elif logging_integration == "dynamic_rate_limiter_v3":
             from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
-                _PROXY_DynamicRateLimitHandlerV3,
+                PROXY_DynamicRateLimitHandlerV3,
             )
 
             for callback in _in_memory_loggers:
-                if isinstance(callback, _PROXY_DynamicRateLimitHandlerV3):
+                if isinstance(callback, PROXY_DynamicRateLimitHandlerV3):
                     return callback
 
         elif logging_integration == "langtrace":
@@ -5993,7 +6023,7 @@ class StandardLoggingPayloadSetup:
         Like get_usage_from_response_obj but returns a plain dict, skipping
         the Pydantic Usage construction on the hot path.
         """
-        _empty: Final[dict] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        _empty: Final[dict[str, object]] = {}
         if combined_usage_object is not None:
             return combined_usage_object.model_dump()
         if not response_obj:
@@ -6516,7 +6546,7 @@ def _extract_response_obj_and_hidden_params(
 ) -> tuple[dict, dict | None]:
     """Extract response_obj and hidden_params from init_response_obj."""
     hidden_params: dict | None = (
-        getattr(init_response_obj, "_hidden_params", None)
+        getattr(init_response_obj, HIDDEN_PARAMS_ATTR, None)
         if isinstance(init_response_obj, BaseModel | HttpxBinaryResponseContent)
         else None
     )
