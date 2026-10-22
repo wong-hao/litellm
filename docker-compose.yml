@@ -23,6 +23,11 @@ services:
       # DATABASE_URL_READ_REPLICA: "postgresql://llmproxy:dbpassword9090@db-reader:5432/litellm"
       STORE_MODEL_IN_DB: "True" # allows adding models to proxy via UI
       #LITELLM_LOG: "DEBUG" # enable debug logs
+      DOCS_URL: "/docs"              # Set docs to a different path
+      ROOT_REDIRECT_URL: "/ui"       # Redirect root path (/) to /ui
+      NO_DOCS: "True" # Restrict all API documentation for production/air-gapped deployments
+      NO_REDOC: "True"
+      NO_OPENAPI: "True"
     env_file:
       - .env # Load local .env file
     depends_on:
