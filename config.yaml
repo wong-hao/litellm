@@ -3,29 +3,23 @@ model_list:
   - model_name: qwen3.5-35b
     litellm_params:
       model: custom_openai/qwen3.5-35b
-      api_base: http://202.115.138.32:8011/v1
-      api_key: sk-fc2e5f6697404812b099dad7f8a
+      api_base: https://mmaigateway.cdut.edu.cn/v1
+      api_key: sk-777Lj52EoVp61fMfKhyAlb4hKff0Ododf10CFBnAY6f9HIPc
 
   # Qwen3.8-Flash-Next
   - model_name: qwen3.8-flash-next
     litellm_params:
       model: custom_openai/qwen3.8-flash-next
-      api_base: http://202.115.138.235:30002/v1
-      api_key: sk-cdutwxc2026qwen3
+      api_base: https://mmaigateway.cdut.edu.cn/v1
+      api_key: sk-777Lj52EoVp61fMfKhyAlb4hKff0Ododf10CFBnAY6f9HIPc
 
   # DeepSeek V4.1 Flash
   - model_name: deepseek-v41-flash
     litellm_params:
-      model: custom_openai/dsv41
-      api_base: http://202.115.138.84:2999/v1
+      model: custom_openai/deepseek-v41-flash
+      api_base: https://mmaigateway.cdut.edu.cn/v1
+      api_key: sk-777Lj52EoVp61fMfKhyAlb4hKff0Ododf10CFBnAY6f9HIPc
 
-  # bge-m3 embedding
-  - model_name: bge-m3
-    litellm_params:
-      model: hosted_vllm/bge-m3
-      api_base: http://202.115.138.34:8000/v1
-      api_key: sk-cdutwxc2026bge
-      
   # Auto Router
   #- model_name: deepseek-v41-flash
   #  litellm_params:
